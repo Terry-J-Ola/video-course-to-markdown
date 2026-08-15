@@ -11,3 +11,4 @@ outputs/
 # Local development process artifacts
 .superpowers/
 docs/superpowers/
+.trae/
