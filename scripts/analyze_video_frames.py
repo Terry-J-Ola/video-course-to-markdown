@@ -19,6 +19,7 @@ try:
         write_json_atomic,
     )
     from .env_config import get_qwen_api_key
+    from .http_transport import open_url
 except ImportError:
     from checkpoint_provenance import (
         checkpoint_matches,
@@ -27,6 +28,7 @@ except ImportError:
         write_json_atomic,
     )
     from env_config import get_qwen_api_key
+    from http_transport import open_url
 
 
 SYSTEM_PROMPT = r"""
@@ -179,7 +181,7 @@ def invoke_group(
     last_error = None
     for attempt in range(1, 4):
         try:
-            with urllib.request.urlopen(request, timeout=240) as response:
+            with open_url(request, timeout=240) as response:
                 raw = json.loads(response.read().decode("utf-8"))
             message = response_content(raw)
             parsed = parse_json_content(message)
@@ -196,6 +198,7 @@ def invoke_group(
         except (
             urllib.error.HTTPError,
             urllib.error.URLError,
+            OSError,
             TimeoutError,
             json.JSONDecodeError,
             TypeError,

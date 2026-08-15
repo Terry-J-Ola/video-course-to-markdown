@@ -5,7 +5,8 @@
 - Python 3.10 或更高版本
 - 可访问阿里云 DashScope 的网络环境
 - 系统 `PATH` 中存在 FFmpeg，或安装 `imageio-ffmpeg`
-- Python 依赖：`pillow`、`numpy`、`imageio-ffmpeg`、`dashscope`
+- Python 依赖：`pillow`、`numpy`、`imageio-ffmpeg`、`certifi`
+- DashScope HTTPS 请求使用显式 `certifi` 信任链并保持主机名与证书校验；不得通过关闭 SSL 校验规避连接错误。
 
 环境文件来源的解析规则如下：
 

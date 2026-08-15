@@ -32,6 +32,7 @@ def run_pipeline(*args: str, env: dict[str, str] | None = None) -> subprocess.Co
         "DASHSCOPE_ASR_API_KEY",
     ):
         process_env.pop(name, None)
+    process_env["PYTHONIOENCODING"] = "utf-8"
     if env:
         process_env.update(env)
     return subprocess.run(
@@ -175,7 +176,7 @@ class ResumeProvenanceTests(unittest.TestCase):
             output = root / "visual"
             with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-only"}, clear=True):
                 with mock.patch.object(
-                    analyze_video_frames.urllib.request, "urlopen", side_effect=visual_response
+                    analyze_video_frames, "open_url", side_effect=visual_response
                 ) as urlopen:
                     self.assertEqual(run_visual_stage(manifest, output), 0)
                     self.assertEqual(run_visual_stage(manifest, output), 0)
@@ -190,7 +191,7 @@ class ResumeProvenanceTests(unittest.TestCase):
             output = root / "visual"
             with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-only"}, clear=True):
                 with mock.patch.object(
-                    analyze_video_frames.urllib.request, "urlopen", side_effect=visual_response
+                    analyze_video_frames, "open_url", side_effect=visual_response
                 ) as urlopen:
                     self.assertEqual(run_visual_stage(manifest, output, model="visual-old"), 0)
                     self.assertEqual(run_visual_stage(manifest, output, model="visual-new"), 0)
@@ -206,7 +207,7 @@ class ResumeProvenanceTests(unittest.TestCase):
             output = root / "visual"
             with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-only"}, clear=True):
                 with mock.patch.object(
-                    analyze_video_frames.urllib.request, "urlopen", side_effect=visual_response
+                    analyze_video_frames, "open_url", side_effect=visual_response
                 ) as urlopen:
                     self.assertEqual(run_visual_stage(manifest, output, group_size=2), 0)
                     self.assertEqual(run_visual_stage(manifest, output, group_size=1), 0)
@@ -219,7 +220,7 @@ class ResumeProvenanceTests(unittest.TestCase):
             output = root / "visual"
             with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-only"}, clear=True):
                 with mock.patch.object(
-                    analyze_video_frames.urllib.request, "urlopen", side_effect=visual_response
+                    analyze_video_frames, "open_url", side_effect=visual_response
                 ) as urlopen:
                     self.assertEqual(run_visual_stage(manifest, output), 0)
                     self.assertEqual(run_visual_stage(manifest, output, min_spacing=0.5), 0)
@@ -232,7 +233,7 @@ class ResumeProvenanceTests(unittest.TestCase):
             output = root / "visual"
             with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-only"}, clear=True):
                 with mock.patch.object(
-                    analyze_video_frames.urllib.request, "urlopen", side_effect=visual_response
+                    analyze_video_frames, "open_url", side_effect=visual_response
                 ) as urlopen:
                     self.assertEqual(run_visual_stage(manifest, output), 0)
                     video.write_bytes(b"video-version-two-is-different")
@@ -258,8 +259,8 @@ class ResumeProvenanceTests(unittest.TestCase):
 
             with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-only"}, clear=True):
                 with mock.patch.object(
-                    analyze_video_frames.urllib.request,
-                    "urlopen",
+                    analyze_video_frames,
+                    "open_url",
                     side_effect=provider_response,
                 ):
                     self.assertEqual(
@@ -294,8 +295,8 @@ class ResumeProvenanceTests(unittest.TestCase):
                     analyze_video_frames.time, "sleep", return_value=None
                 ):
                     with mock.patch.object(
-                        analyze_video_frames.urllib.request,
-                        "urlopen",
+                        analyze_video_frames,
+                        "open_url",
                         side_effect=[invalid, invalid, invalid],
                     ):
                         with self.assertRaisesRegex(RuntimeError, "group 1 failed"):
@@ -304,8 +305,8 @@ class ResumeProvenanceTests(unittest.TestCase):
                     checkpoint = output / "group_0001_checkpoint.json"
                     self.assertFalse(checkpoint.exists())
                     with mock.patch.object(
-                        analyze_video_frames.urllib.request,
-                        "urlopen",
+                        analyze_video_frames,
+                        "open_url",
                         return_value=valid,
                     ) as urlopen:
                         self.assertEqual(run_visual_stage(manifest, output), 0)
@@ -322,8 +323,8 @@ class ResumeProvenanceTests(unittest.TestCase):
                     analyze_video_frames.time, "sleep", return_value=None
                 ):
                     with mock.patch.object(
-                        analyze_video_frames.urllib.request,
-                        "urlopen",
+                        analyze_video_frames,
+                        "open_url",
                         side_effect=[malformed, malformed, malformed],
                     ) as urlopen:
                         with self.assertRaisesRegex(RuntimeError, "group 1 failed"):
@@ -350,8 +351,8 @@ class ResumeProvenanceTests(unittest.TestCase):
                     analyze_video_frames.time, "sleep", return_value=None
                 ):
                     with mock.patch.object(
-                        analyze_video_frames.urllib.request,
-                        "urlopen",
+                        analyze_video_frames,
+                        "open_url",
                         side_effect=responses,
                     ) as urlopen:
                         with self.assertRaisesRegex(RuntimeError, "group 1 failed"):
@@ -372,8 +373,8 @@ class ResumeProvenanceTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-only"}, clear=True):
                 with mock.patch.object(analyze_video_frames.time, "sleep", return_value=None):
                     with mock.patch.object(
-                        analyze_video_frames.urllib.request,
-                        "urlopen",
+                        analyze_video_frames,
+                        "open_url",
                         side_effect=responses,
                     ) as urlopen:
                         with self.assertRaisesRegex(RuntimeError, "group 1 failed"):
@@ -388,7 +389,7 @@ class ResumeProvenanceTests(unittest.TestCase):
             output = root / "visual"
             with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-only"}, clear=True):
                 with mock.patch.object(
-                    analyze_video_frames.urllib.request, "urlopen", side_effect=visual_response
+                    analyze_video_frames, "open_url", side_effect=visual_response
                 ) as urlopen:
                     self.assertEqual(run_visual_stage(manifest, output), 0)
                     (output / "group_0001_raw.json").write_text("[]\n", encoding="utf-8")
@@ -402,7 +403,7 @@ class ResumeProvenanceTests(unittest.TestCase):
             output = root / "visual"
             with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-only"}, clear=True):
                 with mock.patch.object(
-                    analyze_video_frames.urllib.request, "urlopen", side_effect=visual_response
+                    analyze_video_frames, "open_url", side_effect=visual_response
                 ) as urlopen:
                     self.assertEqual(run_visual_stage(manifest, output), 0)
                     (output / "group_0001_raw.json").write_text(
@@ -441,8 +442,8 @@ class ResumeProvenanceTests(unittest.TestCase):
             mixed_response.calls = 0
             with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-only"}, clear=True):
                 with mock.patch.object(
-                    analyze_video_frames.urllib.request,
-                    "urlopen",
+                    analyze_video_frames,
+                    "open_url",
                     side_effect=mixed_response,
                 ):
                     self.assertEqual(
@@ -545,8 +546,8 @@ class ResumeProvenanceTests(unittest.TestCase):
                                 transcribe_video_audio, "request_json", side_effect=fake_request_json
                             ):
                                 with mock.patch.object(
-                                    transcribe_video_audio.urllib.request,
-                                    "urlopen",
+                                    transcribe_video_audio,
+                                    "open_url",
                                     return_value=JsonResponse(transcript),
                                 ):
                                     with contextlib.redirect_stdout(io.StringIO()):

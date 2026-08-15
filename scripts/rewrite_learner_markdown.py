@@ -8,8 +8,10 @@ import urllib.request
 
 try:
     from .env_config import get_qwen_api_key
+    from .http_transport import open_url
 except ImportError:
     from env_config import get_qwen_api_key
+    from http_transport import open_url
 
 
 INSTRUCTION = r"""
@@ -141,7 +143,8 @@ def missing_blocks(blocks: list[str], content: str) -> list[str]:
 
 
 def output_quality(content: str, output: pathlib.Path) -> dict:
-    technical_leakage = sorted(set(TECHNICAL_TERM_RE.findall(content)))
+    prose_content = IMAGE_RE.sub("", content)
+    technical_leakage = sorted(set(TECHNICAL_TERM_RE.findall(prose_content)))
     missing_images: list[str] = []
     for raw_link in IMAGE_RE.findall(content):
         link = raw_link.strip().strip("<>")
@@ -187,7 +190,7 @@ def call_model(api_key: str, model: str, prompt: str, temperature: float) -> tup
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=300) as response:
+        with open_url(request, timeout=300) as response:
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")

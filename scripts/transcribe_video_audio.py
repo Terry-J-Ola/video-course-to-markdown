@@ -1,5 +1,6 @@
 import argparse
 import json
+import mimetypes
 import os
 import pathlib
 import shutil
@@ -7,35 +8,122 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 
 try:
     from .checkpoint_provenance import checkpoint_matches, file_identity, write_checkpoint
     from .env_config import get_asr_api_key
+    from .http_transport import open_url
 except ImportError:
     from checkpoint_provenance import checkpoint_matches, file_identity, write_checkpoint
     from env_config import get_asr_api_key
+    from http_transport import open_url
+
+
+def multipart_form_data(fields: dict[str, str], file_path: pathlib.Path) -> tuple[bytes, str]:
+    boundary = f"----video-course-{uuid.uuid4().hex}"
+    body = bytearray()
+    for name, value in fields.items():
+        body.extend(f"--{boundary}\r\n".encode("ascii"))
+        body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+        body.extend(str(value).encode("utf-8"))
+        body.extend(b"\r\n")
+    content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+    body.extend(f"--{boundary}\r\n".encode("ascii"))
+    body.extend(
+        (
+            f'Content-Disposition: form-data; name="file"; filename="{file_path.name}"\r\n'
+            f"Content-Type: {content_type}\r\n\r\n"
+        ).encode("utf-8")
+    )
+    body.extend(file_path.read_bytes())
+    body.extend(f"\r\n--{boundary}--\r\n".encode("ascii"))
+    return bytes(body), boundary
+
+
+class SecureOssUtils:
+    REQUIRED_UPLOAD_FIELDS = {
+        "oss_access_key_id",
+        "signature",
+        "policy",
+        "upload_dir",
+        "x_oss_object_acl",
+        "x_oss_forbid_overwrite",
+        "upload_host",
+    }
+
+    @classmethod
+    def upload(
+        cls,
+        model: str,
+        file_path: str,
+        api_key: str,
+        upload_certificate: dict | None = None,
+        **_kwargs,
+    ) -> tuple[str, dict]:
+        audio_path = pathlib.Path(file_path)
+        if upload_certificate is None:
+            query = urllib.parse.urlencode({"action": "getPolicy", "model": model})
+            response = request_json(
+                f"https://dashscope.aliyuncs.com/api/v1/uploads?{query}",
+                api_key,
+            )
+            upload_info = response.get("data")
+            if upload_info is None:
+                upload_info = response.get("output")
+        else:
+            upload_info = upload_certificate
+        if not isinstance(upload_info, dict) or not cls.REQUIRED_UPLOAD_FIELDS.issubset(
+            upload_info
+        ):
+            raise RuntimeError("DashScope upload certificate is incomplete")
+
+        object_key = f"{upload_info['upload_dir']}/{audio_path.name}"
+        fields = {
+            "OSSAccessKeyId": upload_info["oss_access_key_id"],
+            "Signature": upload_info["signature"],
+            "policy": upload_info["policy"],
+            "key": object_key,
+            "x-oss-object-acl": upload_info["x_oss_object_acl"],
+            "x-oss-forbid-overwrite": upload_info["x_oss_forbid_overwrite"],
+            "success_action_status": "200",
+            "x-oss-content-type": mimetypes.guess_type(audio_path.name)[0]
+            or "application/octet-stream",
+        }
+        body, boundary = multipart_form_data(fields, audio_path)
+        request = urllib.request.Request(
+            upload_info["upload_host"],
+            data=body,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+            method="POST",
+        )
+        try:
+            with open_url(request, timeout=3600):
+                pass
+        except urllib.error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"OSS upload failed with HTTP {exc.code}: {error_body}") from exc
+        return f"oss://{object_key}", upload_info
 
 
 def configure_dependencies(pydeps: pathlib.Path | None):
     if pydeps:
         sys.path.insert(0, str(pydeps))
-    try:
-        from dashscope.utils.oss_utils import OssUtils
-    except ImportError as exc:
-        raise RuntimeError(
-            "dashscope is unavailable. Run bootstrap_dependencies.py first."
-        ) from exc
     system_ffmpeg = shutil.which("ffmpeg")
     if system_ffmpeg:
-        return system_ffmpeg, OssUtils
+        return system_ffmpeg, SecureOssUtils
     try:
         import imageio_ffmpeg
     except ImportError as exc:
         raise RuntimeError(
             "ffmpeg is unavailable. Install ffmpeg or run bootstrap_dependencies.py."
         ) from exc
-    return imageio_ffmpeg.get_ffmpeg_exe(), OssUtils
+    return imageio_ffmpeg.get_ffmpeg_exe(), SecureOssUtils
 
 
 def extract_audio(ffmpeg: str, video: pathlib.Path, audio: pathlib.Path) -> None:
@@ -96,7 +184,7 @@ def request_json(url: str, api_key: str, method="GET", payload=None, oss_resolve
     data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=180) as response:
+        with open_url(request, timeout=180) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
@@ -269,7 +357,7 @@ def main() -> int:
             transcription_url = results[0].get("transcription_url")
     if not transcription_url:
         raise RuntimeError(f"No transcription URL in task result: {task_result}")
-    with urllib.request.urlopen(transcription_url, timeout=180) as response:
+    with open_url(transcription_url, timeout=180) as response:
         transcription = json.loads(response.read().decode("utf-8"))
     sentences = persist_transcription(
         transcription_path, checkpoint_path, transcription, fingerprint

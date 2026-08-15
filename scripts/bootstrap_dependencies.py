@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 
-PACKAGES = ["pillow", "numpy", "imageio-ffmpeg", "dashscope"]
+PACKAGES = ["pillow", "numpy", "imageio-ffmpeg", "certifi"]
 
 
 def default_target() -> pathlib.Path:
