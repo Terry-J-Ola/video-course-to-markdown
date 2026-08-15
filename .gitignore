@@ -1,0 +1,13 @@
+.env
+!.env.example
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local runtime outputs and verification artifacts
+outputs/
+.verification*/
+
+# Local development process artifacts
+.superpowers/
+docs/superpowers/
