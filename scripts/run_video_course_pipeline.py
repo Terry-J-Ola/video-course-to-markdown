@@ -16,6 +16,7 @@ try:
         summarize_token_usage,
         transcription_duration_seconds,
         upsert_processing_stats,
+        validate_xlsx_support,
     )
 except ImportError:
     from checkpoint_provenance import file_identity, read_checkpoint_fingerprint, write_checkpoint
@@ -25,6 +26,7 @@ except ImportError:
         summarize_token_usage,
         transcription_duration_seconds,
         upsert_processing_stats,
+        validate_xlsx_support,
     )
 
 
@@ -232,7 +234,7 @@ def run_batch(args: argparse.Namespace, input_dir: pathlib.Path) -> int:
     stats_path = (
         pathlib.Path(args.stats_file).expanduser().resolve()
         if args.stats_file
-        else output_root / "视频处理统计.csv"
+        else output_root / "视频处理统计.xlsx"
     )
     batch_report_path = output_root / "批量处理报告.json"
     if not args.dry_run:
@@ -379,6 +381,14 @@ def main() -> int:
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    resolved_pydeps = discover_pydeps(args.pydeps)
+    if resolved_pydeps:
+        args.pydeps = str(resolved_pydeps)
+        pydeps_text = str(resolved_pydeps)
+        if pydeps_text not in sys.path:
+            sys.path.insert(0, pydeps_text)
+    if not args.dry_run:
+        validate_xlsx_support()
     run_started_monotonic = time.monotonic()
     run_started_at = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
 
@@ -422,7 +432,7 @@ def main() -> int:
     processing_stats = (
         pathlib.Path(args.stats_file).expanduser().resolve()
         if args.stats_file
-        else output_dir / "视频处理统计.csv"
+        else output_dir / "视频处理统计.xlsx"
     )
     pydeps = discover_pydeps(args.pydeps)
 
@@ -436,7 +446,7 @@ def main() -> int:
         "models": {
             "visual": args.visual_model,
             "asr": args.asr_model,
-            "text": args.text_model,
+            "text": None if args.skip_business else args.text_model,
         },
         "configuration": {
             "env_source": configuration["source"],

@@ -1,5 +1,4 @@
 import contextlib
-import csv
 import io
 import json
 import os
@@ -11,6 +10,7 @@ import unittest
 from unittest import mock
 
 import yaml
+from openpyxl import load_workbook
 
 from scripts import analyze_video_frames
 from scripts import assemble_evidence_markdown
@@ -807,7 +807,7 @@ class PipelineCliTests(unittest.TestCase):
             visual = next(item for item in records if item.get("stage") == "visual-analysis")
             self.assertIn("qwen3-vl-flash", visual["command"])
             self.assertNotIn("qwen-plus", visual["command"])
-            self.assertTrue(summary["outputs"]["processing_stats"].endswith("视频处理统计.csv"))
+            self.assertTrue(summary["outputs"]["processing_stats"].endswith("视频处理统计.xlsx"))
             self.assertFalse(output.exists())
 
     def test_directory_dry_run_processes_supported_videos_in_sorted_order(self):
@@ -830,7 +830,7 @@ class PipelineCliTests(unittest.TestCase):
             self.assertEqual(batch["planned_videos"], 2)
             starts = [item for item in records if item.get("stage") == "batch-video"]
             self.assertEqual([pathlib.Path(item["video"]).name for item in starts], ["a.mov", "b.mp4"])
-            self.assertTrue(batch["processing_stats"].endswith("视频处理统计.csv"))
+            self.assertTrue(batch["processing_stats"].endswith("视频处理统计.xlsx"))
             self.assertFalse(output.exists())
 
     def test_batch_continues_after_failure_and_writes_batch_report(self):
@@ -864,13 +864,16 @@ class PipelineCliTests(unittest.TestCase):
                 [item["status"] for item in report["results"]],
                 ["complete", "failed"],
             )
-            stats_path = output / "视频处理统计.csv"
-            with stats_path.open("r", encoding="utf-8-sig", newline="") as handle:
-                rows = list(csv.DictReader(handle))
+            stats_path = output / "视频处理统计.xlsx"
+            workbook = load_workbook(stats_path, data_only=True)
+            detail = workbook["逐视频统计"]
+            headers = [cell.value for cell in detail[1]]
+            rows = [dict(zip(headers, values)) for values in detail.iter_rows(min_row=2, values_only=True)]
             failed = next(row for row in rows if row["视频路径"] == str(second.resolve()))
             self.assertEqual(failed["状态"], "failed")
             self.assertIn("exit code 7", failed["错误信息"])
             self.assertTrue(pathlib.Path(failed["处理报告"]).is_file())
+            workbook.close()
 
     def test_dry_run_routes_custom_models_to_every_consuming_stage(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -1083,7 +1086,7 @@ class PipelineCliTests(unittest.TestCase):
             )
             self.assertEqual(persisted["status"], "complete")
 
-    def test_real_run_writes_processing_stats_csv_and_report_usage(self):
+    def test_real_run_writes_processing_stats_xlsx_and_report_usage(self):
         with tempfile.TemporaryDirectory() as raw:
             root = pathlib.Path(raw)
             video = root / "course.mp4"
@@ -1192,15 +1195,26 @@ class PipelineCliTests(unittest.TestCase):
             summary = json.loads(stdout.getvalue().splitlines()[-1])
             stats_path = pathlib.Path(summary["outputs"]["processing_stats"])
             self.assertTrue(stats_path.is_file())
-            with stats_path.open("r", encoding="utf-8-sig", newline="") as handle:
-                rows = list(csv.DictReader(handle))
+            workbook = load_workbook(stats_path, data_only=True)
+            detail = workbook["逐视频统计"]
+            headers = [cell.value for cell in detail[1]]
+            rows = [dict(zip(headers, values)) for values in detail.iter_rows(min_row=2, values_only=True)]
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["视频路径"], str(video.resolve()))
-            self.assertEqual(rows[0]["视觉总Token"], "15")
-            self.assertEqual(rows[0]["文本总Token"], "30")
-            self.assertEqual(rows[0]["Qwen总Token"], "45")
-            self.assertEqual(rows[0]["ASR音频时长（秒）"], "12.5")
-            self.assertEqual(rows[0]["视觉分析耗时（秒）"], "2.0")
+            self.assertEqual(rows[0]["视觉总Token"], 15)
+            self.assertEqual(rows[0]["文本总Token"], 30)
+            self.assertEqual(rows[0]["单视频总Token"], 45)
+            self.assertEqual(rows[0]["ASR音频时长（秒）"], 12.5)
+            self.assertEqual(rows[0]["视觉分析耗时（秒）"], 2.0)
+            batch_sheet = workbook["批次汇总"]
+            batch_values = dict(
+                zip(
+                    [cell.value for cell in batch_sheet[1]],
+                    [cell.value for cell in batch_sheet[2]],
+                )
+            )
+            self.assertEqual(batch_values["批次总Token"], 45)
+            workbook.close()
 
             report = json.loads(pathlib.Path(summary["report"]).read_text(encoding="utf-8"))
             self.assertEqual(report["usage"]["qwen_total_tokens"], 45)
@@ -1249,12 +1263,12 @@ class PipelineCliTests(unittest.TestCase):
                             self.assertEqual(run_video_course_pipeline.main(), 0)
 
             # 关键断言：产物不在 output_root 根下，而在 output_root / "course" 子目录下
-            self.assertFalse((output_root / "视频处理统计.csv").exists())
+            self.assertFalse((output_root / "视频处理统计.xlsx").exists())
             self.assertFalse((output_root / "_video_course_work").exists())
             self.assertFalse((output_root / "course_处理报告.json").exists())
 
             self.assertTrue((output_root / "course").is_dir())
-            self.assertTrue((output_root / "course" / "视频处理统计.csv").is_file())
+            self.assertTrue((output_root / "course" / "视频处理统计.xlsx").is_file())
             self.assertTrue((output_root / "course" / "course_处理报告.json").is_file())
             self.assertTrue((output_root / "course" / "_video_course_work" / "course").is_dir())
 
@@ -1426,11 +1440,12 @@ class SkillDocumentationTests(unittest.TestCase):
             "DASHSCOPE_QWEN_API_KEY",
             "DASHSCOPE_ASR_API_KEY",
             "DASHSCOPE_API_KEY",
-            "视频处理统计.csv",
+            "视频处理统计.xlsx",
             "批量处理报告.json",
             "--recursive",
             "文件夹路径",
-            "Qwen总Token",
+            "单视频总Token",
+            "批次总Token",
             "ASR音频时长",
             "本地",
             "DashScope",
