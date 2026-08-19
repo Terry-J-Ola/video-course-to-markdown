@@ -99,13 +99,25 @@ def parse_json_content(content: str) -> dict:
     content = re.sub(r"\s*```$", "", content)
     try:
         parsed = json.loads(content)
-    except json.JSONDecodeError:
-        # 模型可能在 JSON 前后加了说明文字，尝试提取第一个 { 到最后一个 } 之间的内容
-        start = content.find("{")
-        end = content.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise
-        parsed = json.loads(content[start : end + 1])
+    except json.JSONDecodeError as original_error:
+        # 模型可能在结果前后加说明或示例对象。逐个尝试完整 JSON 对象，
+        # 只接受满足视觉结果结构的对象，避免“第一个 { 到最后一个 }”误拼多个对象。
+        decoder = json.JSONDecoder()
+        parsed = None
+        for match in re.finditer(r"{", content):
+            try:
+                candidate, _ = decoder.raw_decode(content[match.start() :])
+            except json.JSONDecodeError:
+                continue
+            if (
+                isinstance(candidate, dict)
+                and isinstance(candidate.get("frames"), list)
+                and all(isinstance(frame, dict) for frame in candidate["frames"])
+            ):
+                parsed = candidate
+                break
+        if parsed is None:
+            raise original_error
     if not isinstance(parsed, dict) or not isinstance(parsed.get("frames"), list):
         raise ValueError("visual result must be an object with a frames list")
     if not all(isinstance(frame, dict) for frame in parsed["frames"]):

@@ -106,6 +106,32 @@ def run_visual_stage(
 
 
 class DependencyPropagationTests(unittest.TestCase):
+    def test_child_python_processes_force_utf8_streams(self):
+        report = {"stages": []}
+        completed = subprocess.CompletedProcess(["python"], 0)
+        with mock.patch.dict(
+            os.environ,
+            {"PYTHONIOENCODING": "legacy", "PYTHONUTF8": "0"},
+            clear=False,
+        ):
+            with mock.patch.object(
+                run_video_course_pipeline.subprocess,
+                "run",
+                return_value=completed,
+            ) as runner:
+                run_video_course_pipeline.run_stage(
+                    "utf8-stage", ["python", "stage.py"], report, False
+                )
+                self.assertEqual(
+                    run_video_course_pipeline.run_batch_child(["python", "batch.py"]), 0
+                )
+
+        stage_environment = runner.call_args_list[0].kwargs["env"]
+        batch_environment = runner.call_args_list[1].kwargs["env"]
+        for environment in (stage_environment, batch_environment):
+            self.assertEqual(environment["PYTHONIOENCODING"], "utf-8")
+            self.assertEqual(environment["PYTHONUTF8"], "1")
+
     def test_pydeps_are_prepended_for_real_extraction_and_contact_sheet_imports(self):
         with tempfile.TemporaryDirectory() as raw:
             root = pathlib.Path(raw)
@@ -168,6 +194,16 @@ class ResumeProvenanceTests(unittest.TestCase):
             encoding="utf-8",
         )
         return video, manifest
+
+    def test_visual_json_parser_recovers_valid_object_from_wrapped_prose(self):
+        content = (
+            '说明中的示例对象 {"status":"illustration"}；实际结果如下：'
+            '{"frames":[{"frame_index":1}]}，以上。'
+        )
+
+        parsed = analyze_video_frames.parse_json_content(content)
+
+        self.assertEqual(parsed, {"frames": [{"frame_index": 1}]})
 
     def test_visual_checkpoint_is_reused_when_provenance_is_compatible(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -294,16 +330,31 @@ class ResumeProvenanceTests(unittest.TestCase):
                 with mock.patch.object(
                     analyze_video_frames.time, "sleep", return_value=None
                 ):
-                    with mock.patch.object(
-                        analyze_video_frames,
-                        "open_url",
-                        side_effect=[invalid, invalid, invalid],
-                    ):
-                        with self.assertRaisesRegex(RuntimeError, "group 1 failed"):
-                            run_visual_stage(manifest, output)
+                    diagnostics = io.StringIO()
+                    with contextlib.redirect_stderr(diagnostics):
+                        with mock.patch.object(
+                            analyze_video_frames,
+                            "open_url",
+                            side_effect=[invalid, invalid, invalid],
+                        ):
+                            with self.assertRaisesRegex(
+                                RuntimeError, "group 1 failed after 3 attempts"
+                            ):
+                                run_visual_stage(manifest, output)
 
                     checkpoint = output / "group_0001_checkpoint.json"
                     self.assertFalse(checkpoint.exists())
+                    raw_response = json.loads(
+                        (output / "group_0001_raw.json").read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(raw_response["choices"][0]["message"]["content"], "not-json")
+                    diagnostic_records = [
+                        json.loads(line) for line in diagnostics.getvalue().splitlines()
+                    ]
+                    self.assertEqual([item["attempt"] for item in diagnostic_records], [1, 2, 3])
+                    self.assertTrue(
+                        all(item["error_type"] == "JSONDecodeError" for item in diagnostic_records)
+                    )
                     with mock.patch.object(
                         analyze_video_frames,
                         "open_url",

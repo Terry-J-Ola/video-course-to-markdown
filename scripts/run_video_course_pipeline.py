@@ -80,6 +80,13 @@ def discover_pydeps(explicit: str | None) -> pathlib.Path | None:
     return None
 
 
+def utf8_child_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["PYTHONIOENCODING"] = "utf-8"
+    environment["PYTHONUTF8"] = "1"
+    return environment
+
+
 def run_stage(
     name: str,
     command: list[str],
@@ -92,7 +99,7 @@ def run_stage(
         return
     started = time.monotonic()
     print(json.dumps({"stage": name, "status": "running"}, ensure_ascii=False), flush=True)
-    child_environment = os.environ.copy()
+    child_environment = utf8_child_environment()
     pydeps = report.get("pydeps")
     if pydeps:
         inherited = child_environment.get("PYTHONPATH")
@@ -220,7 +227,11 @@ def build_batch_child_command(
 
 
 def run_batch_child(command: list[str]) -> int:
-    return subprocess.run(command, check=False).returncode
+    return subprocess.run(
+        command,
+        check=False,
+        env=utf8_child_environment(),
+    ).returncode
 
 
 def run_batch(args: argparse.Namespace, input_dir: pathlib.Path) -> int:
