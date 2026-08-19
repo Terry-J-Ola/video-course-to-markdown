@@ -97,7 +97,15 @@ def parse_json_content(content: str) -> dict:
     content = content.strip()
     content = re.sub(r"^```(?:json)?\s*", "", content)
     content = re.sub(r"\s*```$", "", content)
-    parsed = json.loads(content)
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        # 模型可能在 JSON 前后加了说明文字，尝试提取第一个 { 到最后一个 } 之间的内容
+        start = content.find("{")
+        end = content.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        parsed = json.loads(content[start : end + 1])
     if not isinstance(parsed, dict) or not isinstance(parsed.get("frames"), list):
         raise ValueError("visual result must be an object with a frames list")
     if not all(isinstance(frame, dict) for frame in parsed["frames"]):
@@ -183,9 +191,9 @@ def invoke_group(
         try:
             with open_url(request, timeout=240) as response:
                 raw = json.loads(response.read().decode("utf-8"))
+            write_json_atomic(raw_path, raw)
             message = response_content(raw)
             parsed = parse_json_content(message)
-            write_json_atomic(raw_path, raw)
             if fingerprint is not None:
                 write_checkpoint(checkpoint_path, fingerprint)
             return {
@@ -204,14 +212,29 @@ def invoke_group(
             TypeError,
             ValueError,
         ) as exc:
+            error_type = type(exc).__name__
             if isinstance(exc, urllib.error.HTTPError):
                 body = exc.read().decode("utf-8", errors="replace")
                 last_error = f"HTTP {exc.code}: {body}"
             else:
                 last_error = repr(exc)
+            print(
+                json.dumps(
+                    {
+                        "group_id": group_id,
+                        "attempt": attempt,
+                        "max_attempts": 3,
+                        "error_type": error_type,
+                        "error_message": last_error[:200],
+                    },
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
             if attempt < 3:
                 time.sleep(2**attempt)
-    raise RuntimeError(f"group {group_id} failed: {last_error}")
+    raise RuntimeError(f"group {group_id} failed after 3 attempts: {last_error}")
 
 
 def main() -> int:
