@@ -1,4 +1,5 @@
 import json
+import io
 import pathlib
 import ssl
 import tempfile
@@ -128,7 +129,9 @@ class HttpTransportTests(unittest.TestCase):
             200,
             json.dumps(
                 {
-                    "choices": [{"message": {"content": "# Learner"}}],
+                    "output": {
+                        "choices": [{"message": {"content": "# Learner"}}]
+                    },
                     "usage": {"total_tokens": 7},
                 }
             ).encode("utf-8"),
@@ -147,6 +150,101 @@ class HttpTransportTests(unittest.TestCase):
         self.assertEqual(content, "# Learner")
         self.assertEqual(usage["total_tokens"], 7)
         open_url.assert_called_once()
+        request = open_url.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(
+            request.full_url,
+            "https://dashscope.aliyuncs.com/api/v1/services/aigc/"
+            "text-generation/generation",
+        )
+        self.assertNotIn("messages", payload)
+        self.assertEqual(payload["input"]["messages"], [
+            {"role": "user", "content": "prompt"}
+        ])
+        self.assertEqual(payload["parameters"]["result_format"], "message")
+
+    def test_learner_authentication_error_is_classified_without_retry(self):
+        error = urllib.error.HTTPError(
+            "https://dashscope.aliyuncs.com/api",
+            401,
+            "unauthorized",
+            {},
+            io.BytesIO(b'{"code":"InvalidApiKey","message":"invalid key"}'),
+        )
+        with mock.patch.object(
+            rewrite_learner_markdown, "open_url", side_effect=error
+        ) as open_url:
+            with mock.patch.object(rewrite_learner_markdown.time, "sleep") as sleep:
+                with self.assertRaises(
+                    rewrite_learner_markdown.DashScopeAPIError
+                ) as caught:
+                    rewrite_learner_markdown.call_model(
+                        "test-only", "qwen-plus", "prompt", 0.2
+                    )
+
+        self.assertEqual(open_url.call_count, 1)
+        sleep.assert_not_called()
+        self.assertEqual(caught.exception.category, "authentication")
+        self.assertFalse(caught.exception.retryable)
+
+    def test_learner_service_error_retries_then_succeeds(self):
+        unavailable = urllib.error.HTTPError(
+            "https://dashscope.aliyuncs.com/api",
+            503,
+            "unavailable",
+            {},
+            io.BytesIO(b'{"code":"ServiceUnavailable","message":"retry"}'),
+        )
+        success = http_transport.BufferedResponse(
+            json.dumps(
+                {
+                    "output": {"choices": [{"message": {"content": "# Learner"}}]},
+                    "usage": {"total_tokens": 2},
+                }
+            ).encode("utf-8"),
+            200,
+            "ok",
+            {},
+        )
+        with mock.patch.object(
+            rewrite_learner_markdown,
+            "open_url",
+            side_effect=[unavailable, success],
+        ) as open_url:
+            with mock.patch.object(rewrite_learner_markdown.time, "sleep") as sleep:
+                content, _ = rewrite_learner_markdown.call_model(
+                    "test-only", "qwen-plus", "prompt", 0.2
+                )
+
+        self.assertEqual(content, "# Learner")
+        self.assertEqual(open_url.call_count, 2)
+        sleep.assert_called_once_with(2.0)
+
+    def test_learner_network_error_retries_then_succeeds(self):
+        success = http_transport.BufferedResponse(
+            json.dumps(
+                {
+                    "output": {"choices": [{"message": {"content": "# Learner"}}]},
+                    "usage": {"total_tokens": 2},
+                }
+            ).encode("utf-8"),
+            200,
+            "ok",
+            {},
+        )
+        with mock.patch.object(
+            rewrite_learner_markdown,
+            "open_url",
+            side_effect=[urllib.error.URLError("offline"), success],
+        ) as open_url:
+            with mock.patch.object(rewrite_learner_markdown.time, "sleep") as sleep:
+                content, _ = rewrite_learner_markdown.call_model(
+                    "test-only", "qwen-plus", "prompt", 0.2
+                )
+
+        self.assertEqual(content, "# Learner")
+        self.assertEqual(open_url.call_count, 2)
+        sleep.assert_called_once_with(2.0)
 
     def test_asr_json_request_uses_shared_transport(self):
         response = http_transport.BufferedResponse(
@@ -166,6 +264,59 @@ class HttpTransportTests(unittest.TestCase):
 
         self.assertEqual(result["output"]["task_id"], "task-1")
         open_url.assert_called_once()
+
+    def test_asr_permission_error_is_classified_without_retry(self):
+        error = urllib.error.HTTPError(
+            "https://dashscope.aliyuncs.com/api",
+            403,
+            "forbidden",
+            {},
+            io.BytesIO(b'{"code":"AccessDenied","message":"no permission"}'),
+        )
+        with mock.patch.object(
+            transcribe_video_audio, "open_url", side_effect=error
+        ) as open_url:
+            with mock.patch.object(transcribe_video_audio.time, "sleep") as sleep:
+                with self.assertRaises(transcribe_video_audio.DashScopeAPIError) as caught:
+                    transcribe_video_audio.request_json(
+                        "https://dashscope.aliyuncs.com/asr",
+                        "test-only",
+                        method="POST",
+                        payload={"model": "paraformer-v2"},
+                    )
+
+        self.assertEqual(open_url.call_count, 1)
+        sleep.assert_not_called()
+        self.assertEqual(caught.exception.category, "permission")
+        self.assertFalse(caught.exception.retryable)
+
+    def test_asr_rate_limit_retries_using_retry_after(self):
+        limited = urllib.error.HTTPError(
+            "https://dashscope.aliyuncs.com/api",
+            429,
+            "limited",
+            {"Retry-After": "0.5"},
+            io.BytesIO(b'{"code":"Throttling","message":"slow down"}'),
+        )
+        success = http_transport.BufferedResponse(
+            b'{"output":{"task_id":"task-1"}}', 200, "ok", {}
+        )
+        with mock.patch.object(
+            transcribe_video_audio,
+            "open_url",
+            side_effect=[limited, success],
+        ) as open_url:
+            with mock.patch.object(transcribe_video_audio.time, "sleep") as sleep:
+                result = transcribe_video_audio.request_json(
+                    "https://dashscope.aliyuncs.com/asr",
+                    "test-only",
+                    method="POST",
+                    payload={"model": "paraformer-v2"},
+                )
+
+        self.assertEqual(result["output"]["task_id"], "task-1")
+        self.assertEqual(open_url.call_count, 2)
+        sleep.assert_called_once_with(0.5)
 
     def test_asr_audio_upload_avoids_sdk_requests_transport(self):
         upload_info = {
@@ -205,6 +356,45 @@ class HttpTransportTests(unittest.TestCase):
         self.assertIn("multipart/form-data", upload_request.get_header("Content-type"))
         self.assertNotIn("Authorization", dict(upload_request.header_items()))
         self.assertIn(b"audio-bytes", upload_request.data)
+
+    def test_asr_oss_upload_access_denied_is_not_mislabeled_as_key_permission(self):
+        upload_info = {
+            "oss_access_key_id": "access-id",
+            "signature": "signature",
+            "policy": "policy",
+            "upload_dir": "upload-dir",
+            "x_oss_object_acl": "private",
+            "x_oss_forbid_overwrite": "true",
+            "upload_host": "https://upload.example",
+        }
+        denied = urllib.error.HTTPError(
+            "https://upload.example",
+            403,
+            "forbidden",
+            {},
+            io.BytesIO(b'<Error><Code>AccessDenied</Code></Error>'),
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            audio = pathlib.Path(raw) / "audio.mp3"
+            audio.write_bytes(b"audio-bytes")
+            with mock.patch.object(
+                transcribe_video_audio, "open_url", side_effect=denied
+            ) as open_url:
+                with mock.patch.object(transcribe_video_audio.time, "sleep") as sleep:
+                    with self.assertRaises(
+                        transcribe_video_audio.DashScopeAPIError
+                    ) as caught:
+                        transcribe_video_audio.SecureOssUtils.upload(
+                            model="paraformer-v2",
+                            file_path=str(audio),
+                            api_key="test-only",
+                            upload_certificate=upload_info,
+                        )
+
+        self.assertEqual(open_url.call_count, 1)
+        sleep.assert_not_called()
+        self.assertEqual(caught.exception.category, "resource_access")
+        self.assertFalse(caught.exception.retryable)
 
     def test_quality_audit_ignores_frame_names_inside_valid_image_links(self):
         with tempfile.TemporaryDirectory() as raw:

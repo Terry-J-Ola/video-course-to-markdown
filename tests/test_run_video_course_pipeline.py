@@ -6,7 +6,9 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import urllib.error
 from unittest import mock
 
 import yaml
@@ -36,7 +38,7 @@ def run_pipeline(*args: str, env: dict[str, str] | None = None) -> subprocess.Co
     if env:
         process_env.update(env)
     return subprocess.run(
-        [sys.executable, str(PIPELINE), *args],
+        [sys.executable, str(PIPELINE), *args, "--json-output"],
         cwd=ROOT,
         env=process_env,
         text=True,
@@ -73,7 +75,15 @@ def visual_response(request, timeout=240):
     return JsonResponse(
         {
             "model": payload["model"],
-            "choices": [{"message": {"content": json.dumps({"frames": []})}}],
+            "output": {
+                "choices": [
+                    {
+                        "message": {
+                            "content": [{"text": json.dumps({"frames": []})}]
+                        }
+                    }
+                ]
+            },
             "usage": {},
         }
     )
@@ -106,6 +116,170 @@ def run_visual_stage(
 
 
 class DependencyPropagationTests(unittest.TestCase):
+    def test_run_stage_persists_details_and_keeps_child_output_off_human_console(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            log_path = root / "视频处理日志.jsonl"
+            detailed_value = str(root / "very" / "long" / "absolute" / "detail.txt")
+            report = {
+                "stages": [],
+                "_runtime": {
+                    "json_output": False,
+                    "log_file": str(log_path),
+                },
+            }
+            console = io.StringIO()
+
+            with contextlib.redirect_stdout(console):
+                run_video_course_pipeline.run_stage(
+                    "visual-analysis",
+                    [sys.executable, "-c", f"print({detailed_value!r})"],
+                    report,
+                    False,
+                )
+
+            terminal_text = console.getvalue()
+            log_records = [
+                json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertIn("画面分析", terminal_text)
+            self.assertNotIn(detailed_value, terminal_text)
+            self.assertTrue(
+                any(detailed_value in item.get("content", "") for item in log_records)
+            )
+            self.assertTrue(
+                any(sys.executable in item.get("command", []) for item in log_records)
+            )
+
+    def test_run_stage_failure_persists_stderr_and_exit_code(self):
+        with tempfile.TemporaryDirectory() as raw:
+            log_path = pathlib.Path(raw) / "视频处理日志.jsonl"
+            report = {
+                "stages": [],
+                "_runtime": {
+                    "json_output": False,
+                    "log_file": str(log_path),
+                },
+            }
+            console = io.StringIO()
+            command = [
+                sys.executable,
+                "-c",
+                "import sys; print('FAIL-DETAIL', file=sys.stderr); raise SystemExit(7)",
+            ]
+
+            with contextlib.redirect_stdout(console):
+                with self.assertRaisesRegex(subprocess.CalledProcessError, "exit status 7"):
+                    run_video_course_pipeline.run_stage(
+                        "audio-transcription", command, report, False
+                    )
+
+            records = [
+                json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertNotIn("FAIL-DETAIL", console.getvalue())
+            self.assertTrue(
+                any("FAIL-DETAIL" in item.get("content", "") for item in records)
+            )
+            failure = next(item for item in records if item["event"] == "stage_failed")
+            self.assertEqual(failure["returncode"], 7)
+
+    def test_run_stage_promotes_structured_dashscope_error(self):
+        report = {"stages": []}
+        detail = {
+            "event": "dashscope_error",
+            "service": "visual",
+            "category": "authentication",
+            "http_status": 401,
+            "provider_code": "InvalidApiKey",
+            "message": "DashScope API Key 无效或已过期",
+            "retryable": False,
+        }
+        command = [
+            sys.executable,
+            "-c",
+            "import json,sys; print(json.dumps(" + repr(detail) + ", ensure_ascii=False), "
+            "file=sys.stderr); raise SystemExit(1)",
+        ]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(run_video_course_pipeline.StageExecutionError) as caught:
+                run_video_course_pipeline.run_stage("visual-analysis", command, report, False)
+
+        self.assertEqual(caught.exception.error_detail["category"], "authentication")
+        self.assertEqual(caught.exception.error_detail["http_status"], 401)
+
+    def test_persistent_log_redacts_unified_api_key_from_child_output(self):
+        with tempfile.TemporaryDirectory() as raw:
+            log_path = pathlib.Path(raw) / "视频处理日志.jsonl"
+            secret = "sk-unified-must-be-redacted"
+            report = {
+                "stages": [],
+                "_runtime": {
+                    "json_output": False,
+                    "log_file": str(log_path),
+                },
+            }
+            command = [
+                sys.executable,
+                "-c",
+                "import os; print(os.environ['DASHSCOPE_API_KEY'])",
+            ]
+
+            with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": secret}, clear=False):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    run_video_course_pipeline.run_stage(
+                        "visual-analysis", command, report, False
+                    )
+
+            log_text = log_path.read_text(encoding="utf-8")
+            self.assertNotIn(secret, log_text)
+            self.assertIn("[REDACTED]", log_text)
+
+    def test_streamed_command_delivers_output_before_process_completion(self):
+        observed: list[tuple[str, str, float]] = []
+        started = time.monotonic()
+        returncode = run_video_course_pipeline.run_streamed_command(
+            [
+                sys.executable,
+                "-c",
+                "import time; print('first', flush=True); time.sleep(0.2); print('second')",
+            ],
+            run_video_course_pipeline.utf8_child_environment(),
+            lambda stream, line: observed.append((stream, line, time.monotonic())),
+        )
+        finished = time.monotonic()
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual([(item[0], item[1]) for item in observed], [
+            ("stdout", "first"),
+            ("stdout", "second"),
+        ])
+        self.assertLess(observed[0][2] - started, finished - observed[0][2])
+
+    def test_persistent_log_rotates_and_preserves_run_id(self):
+        with tempfile.TemporaryDirectory() as raw:
+            log_path = pathlib.Path(raw) / "视频处理日志.jsonl"
+            with mock.patch.object(run_video_course_pipeline, "ACTIVE_RUN_ID", "run-test"):
+                with mock.patch.object(run_video_course_pipeline, "LOG_MAX_BYTES", 240):
+                    with mock.patch.object(run_video_course_pipeline, "LOG_BACKUPS", 2):
+                        for index in range(5):
+                            run_video_course_pipeline.append_log(
+                                log_path,
+                                {"event": "probe", "index": index, "content": "x" * 100},
+                            )
+
+            self.assertTrue(log_path.is_file())
+            self.assertTrue(log_path.with_name(f"{log_path.name}.1").is_file())
+            records = []
+            for candidate in log_path.parent.glob(f"{log_path.name}*"):
+                records.extend(
+                    json.loads(line)
+                    for line in candidate.read_text(encoding="utf-8").splitlines()
+                )
+            self.assertTrue(records)
+            self.assertTrue(all(item["run_id"] == "run-test" for item in records))
+
     def test_child_python_processes_force_utf8_streams(self):
         report = {"stages": []}
         completed = subprocess.CompletedProcess(["python"], 0)
@@ -115,19 +289,24 @@ class DependencyPropagationTests(unittest.TestCase):
             clear=False,
         ):
             with mock.patch.object(
-                run_video_course_pipeline.subprocess,
-                "run",
-                return_value=completed,
-            ) as runner:
-                run_video_course_pipeline.run_stage(
-                    "utf8-stage", ["python", "stage.py"], report, False
-                )
-                self.assertEqual(
-                    run_video_course_pipeline.run_batch_child(["python", "batch.py"]), 0
-                )
+                run_video_course_pipeline,
+                "run_streamed_command",
+                return_value=0,
+            ) as stage_runner:
+                with mock.patch.object(
+                    run_video_course_pipeline.subprocess,
+                    "run",
+                    return_value=completed,
+                ) as batch_runner:
+                    run_video_course_pipeline.run_stage(
+                        "utf8-stage", ["python", "stage.py"], report, False
+                    )
+                    self.assertEqual(
+                        run_video_course_pipeline.run_batch_child(["python", "batch.py"]), 0
+                    )
 
-        stage_environment = runner.call_args_list[0].kwargs["env"]
-        batch_environment = runner.call_args_list[1].kwargs["env"]
+        stage_environment = stage_runner.call_args.args[1]
+        batch_environment = batch_runner.call_args.kwargs["env"]
         for environment in (stage_environment, batch_environment):
             self.assertEqual(environment["PYTHONIOENCODING"], "utf-8")
             self.assertEqual(environment["PYTHONUTF8"], "1")
@@ -204,6 +383,88 @@ class ResumeProvenanceTests(unittest.TestCase):
         parsed = analyze_video_frames.parse_json_content(content)
 
         self.assertEqual(parsed, {"frames": [{"frame_index": 1}]})
+
+    def test_visual_call_uses_dashscope_native_multimodal_protocol(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            _, manifest = self.make_visual_manifest(root)
+            output = root / "visual"
+            with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-only"}, clear=True):
+                with mock.patch.object(
+                    analyze_video_frames, "open_url", side_effect=visual_response
+                ) as urlopen:
+                    self.assertEqual(run_visual_stage(manifest, output), 0)
+
+            request = urlopen.call_args.args[0]
+            payload = json.loads(request.data.decode("utf-8"))
+            self.assertEqual(
+                request.full_url,
+                "https://dashscope.aliyuncs.com/api/v1/services/aigc/"
+                "multimodal-generation/generation",
+            )
+            self.assertNotIn("messages", payload)
+            self.assertIn("messages", payload["input"])
+            content = payload["input"]["messages"][0]["content"]
+            self.assertTrue(any("text" in item for item in content))
+            self.assertTrue(any(item.get("image", "").startswith("data:image/") for item in content))
+            self.assertEqual(payload["parameters"]["result_format"], "message")
+            self.assertEqual(
+                payload["parameters"]["response_format"], {"type": "json_object"}
+            )
+            checkpoint = json.loads(
+                (output / "group_0001_checkpoint.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                checkpoint["fingerprint"]["api_protocol"],
+                "dashscope-native-multimodal-v1",
+            )
+
+    def test_visual_authentication_error_is_not_retried(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            _, manifest = self.make_visual_manifest(root)
+            output = root / "visual"
+            error = urllib.error.HTTPError(
+                "https://dashscope.aliyuncs.com/api",
+                401,
+                "unauthorized",
+                {},
+                io.BytesIO(b'{"code":"InvalidApiKey","message":"invalid key"}'),
+            )
+            with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-only"}, clear=True):
+                with mock.patch.object(analyze_video_frames.time, "sleep") as sleep:
+                    with mock.patch.object(
+                        analyze_video_frames, "open_url", side_effect=error
+                    ) as urlopen:
+                        with self.assertRaisesRegex(RuntimeError, "API Key"):
+                            run_visual_stage(manifest, output)
+
+            self.assertEqual(urlopen.call_count, 1)
+            sleep.assert_not_called()
+
+    def test_visual_rate_limit_retries_and_honors_retry_after(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            _, manifest = self.make_visual_manifest(root)
+            output = root / "visual"
+            limited = urllib.error.HTTPError(
+                "https://dashscope.aliyuncs.com/api",
+                429,
+                "limited",
+                {"Retry-After": "1.5"},
+                io.BytesIO(b'{"code":"Throttling","message":"slow down"}'),
+            )
+            with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-only"}, clear=True):
+                with mock.patch.object(analyze_video_frames.time, "sleep") as sleep:
+                    with mock.patch.object(
+                        analyze_video_frames,
+                        "open_url",
+                        side_effect=[limited, visual_response(mock.Mock(data=b'{"model":"visual-test"}'))],
+                    ) as urlopen:
+                        self.assertEqual(run_visual_stage(manifest, output), 0)
+
+            self.assertEqual(urlopen.call_count, 2)
+            sleep.assert_called_once_with(1.5)
 
     def test_visual_checkpoint_is_reused_when_provenance_is_compatible(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -819,6 +1080,33 @@ class ResumeProvenanceTests(unittest.TestCase):
 
 
 class PipelineCliTests(unittest.TestCase):
+    def test_default_dry_run_console_hides_long_absolute_paths(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            video = root / "很长的课程目录" / "更长的章节目录" / "课程.mp4"
+            video.parent.mkdir(parents=True)
+            video.write_bytes(b"placeholder")
+            output = root / "同样很长的输出目录" / "output"
+            process_env = os.environ.copy()
+            process_env["PYTHONIOENCODING"] = "utf-8"
+
+            result = subprocess.run(
+                [sys.executable, str(PIPELINE), str(video), str(output), "--dry-run"],
+                cwd=ROOT,
+                env=process_env,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("课程.mp4", result.stdout)
+            self.assertIn("计划", result.stdout)
+            self.assertNotIn(str(video.resolve()), result.stdout)
+            self.assertNotIn(str(output.resolve()), result.stdout)
+            self.assertFalse(output.exists())
+
     def test_pipeline_module_is_importable_from_repository_root(self):
         result = subprocess.run(
             [
@@ -882,6 +1170,11 @@ class PipelineCliTests(unittest.TestCase):
             starts = [item for item in records if item.get("stage") == "batch-video"]
             self.assertEqual([pathlib.Path(item["video"]).name for item in starts], ["a.mov", "b.mp4"])
             self.assertTrue(batch["processing_stats"].endswith("视频处理统计.xlsx"))
+            self.assertTrue(batch["business_lectures_dir"].endswith("业务讲义汇总"))
+            self.assertEqual(
+                [item["business_lecture"]["status"] for item in batch["results"]],
+                ["planned", "planned"],
+            )
             self.assertFalse(output.exists())
 
     def test_batch_continues_after_failure_and_writes_batch_report(self):
@@ -911,10 +1204,13 @@ class PipelineCliTests(unittest.TestCase):
             self.assertEqual(report["status"], "partial")
             self.assertEqual(report["completed_videos"], 1)
             self.assertEqual(report["failed_videos"], 1)
+            self.assertEqual(report["business_lecture_failures"], 1)
             self.assertEqual(
                 [item["status"] for item in report["results"]],
                 ["complete", "failed"],
             )
+            self.assertEqual(report["results"][0]["business_lecture"]["status"], "failed")
+            self.assertEqual(report["results"][1]["business_lecture"]["status"], "not-created")
             stats_path = output / "视频处理统计.xlsx"
             workbook = load_workbook(stats_path, data_only=True)
             detail = workbook["逐视频统计"]
@@ -925,6 +1221,184 @@ class PipelineCliTests(unittest.TestCase):
             self.assertIn("exit code 7", failed["错误信息"])
             self.assertTrue(pathlib.Path(failed["处理报告"]).is_file())
             workbook.close()
+
+    def test_batch_copies_business_lectures_to_flat_collection_and_keeps_originals(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            input_dir = root / "input"
+            first = input_dir / "章节一" / "同名课程.mp4"
+            second = input_dir / "章节二" / "同名课程.mp4"
+            first.parent.mkdir(parents=True)
+            second.parent.mkdir(parents=True)
+            first.write_bytes(b"placeholder")
+            second.write_bytes(b"placeholder")
+            output = root / "output"
+            argv = [str(PIPELINE), str(input_dir), str(output), "--recursive"]
+
+            def successful_child(command: list[str]) -> int:
+                video = pathlib.Path(command[2])
+                video_output = pathlib.Path(command[3])
+                video_output.mkdir(parents=True, exist_ok=True)
+                (video_output / f"{video.stem}_业务讲义.md").write_text(
+                    f"# {video.parent.name}",
+                    encoding="utf-8",
+                )
+                return 0
+
+            console = io.StringIO()
+            with mock.patch.object(sys, "argv", argv):
+                with mock.patch.object(
+                    run_video_course_pipeline,
+                    "run_batch_child",
+                    side_effect=successful_child,
+                ):
+                    with contextlib.redirect_stdout(console):
+                        self.assertEqual(run_video_course_pipeline.main(), 0)
+
+            original_first = output / "章节一" / "同名课程" / "同名课程_业务讲义.md"
+            original_second = output / "章节二" / "同名课程" / "同名课程_业务讲义.md"
+            collection = output / "业务讲义汇总"
+            self.assertEqual(original_first.read_text(encoding="utf-8"), "# 章节一")
+            self.assertEqual(original_second.read_text(encoding="utf-8"), "# 章节二")
+
+            report = json.loads((output / "批量处理报告.json").read_text(encoding="utf-8"))
+            collected = [
+                pathlib.Path(item["business_lecture"]["destination"])
+                for item in report["results"]
+            ]
+            self.assertEqual(
+                [path.read_text(encoding="utf-8") for path in collected],
+                ["# 章节一", "# 章节二"],
+            )
+            self.assertEqual(len({path.name.casefold() for path in collected}), 2)
+            self.assertEqual(report["business_lectures_dir"], str(collection.resolve()))
+            self.assertTrue(pathlib.Path(report["business_lectures_manifest"]).is_file())
+            self.assertEqual(
+                [item["business_lecture"]["status"] for item in report["results"]],
+                ["copied", "copied"],
+            )
+            self.assertNotIn(str(first.resolve()), console.getvalue())
+            self.assertNotIn(str(output.resolve()), console.getvalue())
+            log_path = pathlib.Path(report["log_file"])
+            log_records = [
+                json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(log_path, output / "视频处理日志.jsonl")
+            self.assertTrue(
+                any(item.get("video") == str(first.resolve()) for item in log_records)
+            )
+            self.assertTrue(
+                {"batch_started", "batch_video_started", "batch_finished"}.issubset(
+                    {item["event"] for item in log_records}
+                )
+            )
+            self.assertTrue(all(item["run_id"] == report["run_id"] for item in log_records))
+
+    def test_flat_collection_names_are_collision_and_length_safe(self):
+        output_root = pathlib.Path("D:/output")
+        first = run_video_course_pipeline.batch_business_lecture_paths(
+            pathlib.Path("D:/input/a__b/course.mp4"),
+            output_root / "a__b" / "course",
+            output_root,
+        )[1]
+        second = run_video_course_pipeline.batch_business_lecture_paths(
+            pathlib.Path("D:/input/a/b/course.mp4"),
+            output_root / "a" / "b" / "course",
+            output_root,
+        )[1]
+        long_destination = run_video_course_pipeline.batch_business_lecture_paths(
+            pathlib.Path("D:/input/long/course.mp4"),
+            output_root / ("很长目录" * 40) / ("很长课程" * 30),
+            output_root,
+        )[1]
+
+        self.assertNotEqual(first.name.casefold(), second.name.casefold())
+        self.assertLessEqual(len(long_destination.name), 220)
+
+    def test_batch_manifest_removes_stale_managed_lecture_but_keeps_user_file(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            input_dir = root / "input"
+            input_dir.mkdir()
+            first = input_dir / "a.mp4"
+            second = input_dir / "b.mp4"
+            first.write_bytes(b"placeholder")
+            second.write_bytes(b"placeholder")
+            output = root / "output"
+
+            def successful_child(command: list[str]) -> int:
+                video = pathlib.Path(command[2])
+                video_output = pathlib.Path(command[3])
+                video_output.mkdir(parents=True, exist_ok=True)
+                (video_output / f"{video.stem}_业务讲义.md").write_text(
+                    video.name,
+                    encoding="utf-8",
+                )
+                return 0
+
+            def run_once() -> int:
+                argv = [str(PIPELINE), str(input_dir), str(output)]
+                with mock.patch.object(sys, "argv", argv):
+                    with mock.patch.object(
+                        run_video_course_pipeline,
+                        "run_batch_child",
+                        side_effect=successful_child,
+                    ):
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            return run_video_course_pipeline.main()
+
+            self.assertEqual(run_once(), 0)
+            collection = output / "业务讲义汇总"
+            manifest_path = collection / "业务讲义汇总清单.json"
+            first_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            second_entry = next(
+                item for item in first_manifest["entries"] if item["video"] == str(second.resolve())
+            )
+            stale_path = collection / second_entry["filename"]
+            first_entry = next(
+                item for item in first_manifest["entries"] if item["video"] == str(first.resolve())
+            )
+            legacy_path = collection / "legacy-managed-name.md"
+            (collection / first_entry["filename"]).replace(legacy_path)
+            first_entry["filename"] = legacy_path.name
+            manifest_path.write_text(
+                json.dumps(first_manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            user_file = collection / "用户手工文档.md"
+            user_file.write_text("keep", encoding="utf-8")
+
+            second.unlink()
+            self.assertEqual(run_once(), 0)
+
+            self.assertFalse(stale_path.exists())
+            self.assertFalse(legacy_path.exists())
+            self.assertEqual(user_file.read_text(encoding="utf-8"), "keep")
+            second_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(second_manifest["schema_version"], 1)
+            self.assertEqual(second_manifest["pending_cleanup"], [])
+            self.assertEqual(
+                [item["video"] for item in second_manifest["entries"]],
+                [str(first.resolve())],
+            )
+
+    def test_batch_skip_business_does_not_create_collection_directory(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            input_dir = root / "input"
+            input_dir.mkdir()
+            (input_dir / "course.mp4").write_bytes(b"placeholder")
+            output = root / "output"
+            argv = [str(PIPELINE), str(input_dir), str(output), "--skip-business"]
+
+            with mock.patch.object(sys, "argv", argv):
+                with mock.patch.object(run_video_course_pipeline, "run_batch_child", return_value=0):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(run_video_course_pipeline.main(), 0)
+
+            self.assertFalse((output / "业务讲义汇总").exists())
+            report = json.loads((output / "批量处理报告.json").read_text(encoding="utf-8"))
+            self.assertIsNone(report["business_lectures_dir"])
 
     def test_dry_run_routes_custom_models_to_every_consuming_stage(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -962,6 +1436,14 @@ class PipelineCliTests(unittest.TestCase):
                     "text": "text-sentinel",
                 },
             )
+            self.assertEqual(
+                records[-1]["api_protocols"],
+                {
+                    "visual": "dashscope-native-multimodal-v1",
+                    "asr": "dashscope-native-asr-transcription-v1",
+                    "text": "dashscope-native-text-v1",
+                },
+            )
 
     def test_env_file_marks_key_set_without_printing_secret(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -981,6 +1463,33 @@ class PipelineCliTests(unittest.TestCase):
             self.assertTrue(summary["configuration"]["qwen_api_key_set"])
             self.assertTrue(summary["configuration"]["asr_api_key_set"])
             self.assertEqual(summary["configuration"]["env_source"], str(env_file.resolve()))
+
+    def test_cli_unified_api_key_configures_all_models_without_leaking_or_propagating_argument(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            input_dir = root / "input"
+            input_dir.mkdir()
+            (input_dir / "course.mp4").write_bytes(b"placeholder")
+            secret = "sk-one-key-for-all-models"
+
+            result = run_pipeline(
+                str(input_dir),
+                str(root / "output"),
+                "--dry-run",
+                "--api-key",
+                secret,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn(secret, result.stdout + result.stderr)
+            records = [json.loads(line) for line in result.stdout.splitlines()]
+            summary = records[-1]
+            self.assertEqual(summary["configuration_source"], "cli --api-key")
+            child_commands = [
+                item["command"] for item in records if item.get("stage") == "adaptive-keyframes"
+            ]
+            self.assertTrue(child_commands)
+            self.assertTrue(all(secret not in command for command in child_commands))
 
     def test_dedicated_keys_are_reported_separately_without_leaking_values(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -1050,7 +1559,9 @@ class PipelineCliTests(unittest.TestCase):
             video.write_text("not video", encoding="utf-8")
             result = run_pipeline(str(video), str(root / "output"), "--dry-run")
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Unsupported video extension", result.stderr)
+            error = json.loads(result.stderr)
+            self.assertEqual(error["status"], "failed")
+            self.assertIn("Unsupported video extension", error["error"])
             self.assertNotIn('"stage"', result.stdout)
 
     def test_output_path_that_is_a_file_is_rejected(self):
@@ -1076,6 +1587,136 @@ class PipelineCliTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("DASHSCOPE_API_KEY", result.stderr)
             self.assertFalse(output.exists())
+
+    def test_batch_without_key_fails_before_starting_any_video(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            input_dir = root / "input"
+            input_dir.mkdir()
+            (input_dir / "a.mp4").write_bytes(b"a")
+            (input_dir / "b.mp4").write_bytes(b"b")
+            output = root / "output"
+            empty_env = root / "empty.env"
+            empty_env.write_text("# no key\n", encoding="utf-8")
+            argv = [
+                str(PIPELINE),
+                str(input_dir),
+                str(output),
+                "--env-file",
+                str(empty_env),
+            ]
+
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with mock.patch.object(sys, "argv", argv):
+                    with mock.patch.object(
+                        run_video_course_pipeline, "run_batch_child"
+                    ) as child:
+                        with self.assertRaisesRegex(RuntimeError, "DASHSCOPE_API_KEY"):
+                            run_video_course_pipeline.main()
+
+            child.assert_not_called()
+            self.assertFalse(output.exists())
+
+    def test_single_model_failure_writes_structured_failure_report(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            video = root / "course.mp4"
+            video.write_bytes(b"video")
+            output = root / "output"
+            detail = {
+                "event": "dashscope_error",
+                "service": "visual",
+                "category": "authentication",
+                "http_status": 401,
+                "provider_code": "InvalidApiKey",
+                "message": "DashScope API Key 无效或已过期",
+                "retryable": False,
+            }
+
+            def fail_visual(name: str, command: list[str], report: dict, dry_run: bool):
+                report["stages"].append({"name": name, "command": command, "status": "complete"})
+                if name == "adaptive-keyframes":
+                    frames_dir = pathlib.Path(command[3])
+                    frames_dir.mkdir(parents=True, exist_ok=True)
+                    (frames_dir / "manifest.json").write_text(
+                        json.dumps({"mode": "slides"}), encoding="utf-8"
+                    )
+                if name == "visual-analysis":
+                    report["stages"][-1]["status"] = "failed"
+                    raise run_video_course_pipeline.StageExecutionError(
+                        1, command, error_detail=detail
+                    )
+
+            argv = [str(PIPELINE), str(video), str(output)]
+            with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-only"}, clear=True):
+                with mock.patch.object(sys, "argv", argv):
+                    with mock.patch.object(
+                        run_video_course_pipeline, "run_stage", side_effect=fail_visual
+                    ):
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            with contextlib.redirect_stderr(io.StringIO()):
+                                self.assertEqual(run_video_course_pipeline.cli(), 1)
+
+            report_path = output / "course" / "course_处理报告.json"
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "failed")
+            self.assertEqual(report["error_category"], "authentication")
+            self.assertEqual(report["http_status"], 401)
+            self.assertFalse(report["retryable"])
+
+    def test_batch_stops_after_structured_authentication_failure(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            input_dir = root / "input"
+            input_dir.mkdir()
+            first = input_dir / "a.mp4"
+            second = input_dir / "b.mp4"
+            first.write_bytes(b"a")
+            second.write_bytes(b"b")
+            output = root / "output"
+
+            def authentication_failure(command: list[str]) -> int:
+                video = pathlib.Path(command[2])
+                video_output = pathlib.Path(command[3])
+                video_output.mkdir(parents=True, exist_ok=True)
+                (video_output / f"{video.stem}_处理报告.json").write_text(
+                    json.dumps(
+                        {
+                            "video": str(video),
+                            "output_dir": str(video_output),
+                            "status": "failed",
+                            "error": "DashScope API Key 无效或已过期",
+                            "error_category": "authentication",
+                            "http_status": 401,
+                            "retryable": False,
+                            "models": {},
+                            "stages": [],
+                            "timing": {},
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                return 1
+
+            argv = [str(PIPELINE), str(input_dir), str(output)]
+            with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-only"}, clear=True):
+                with mock.patch.object(sys, "argv", argv):
+                    with mock.patch.object(
+                        run_video_course_pipeline,
+                        "run_batch_child",
+                        side_effect=authentication_failure,
+                    ) as child:
+                        with contextlib.redirect_stdout(io.StringIO()):
+                            self.assertEqual(run_video_course_pipeline.main(), 1)
+
+            self.assertEqual(child.call_count, 1)
+            report = json.loads((output / "批量处理报告.json").read_text(encoding="utf-8"))
+            self.assertTrue(report["stopped_early"])
+            self.assertEqual(report["stop_category"], "authentication")
+            self.assertEqual([item["status"] for item in report["results"]], ["failed", "skipped"])
+            self.assertIn("API Key", report["results"][0]["error"])
+            self.assertEqual(report["skipped_videos"], 1)
 
     def test_real_run_persists_models_and_configuration_in_report(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -1112,6 +1753,7 @@ class PipelineCliTests(unittest.TestCase):
                 "asr-report",
                 "--text-model",
                 "text-report",
+                "--json-output",
             ]
             with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-only"}, clear=True):
                 with mock.patch.object(sys, "argv", argv):
@@ -1136,6 +1778,14 @@ class PipelineCliTests(unittest.TestCase):
                 },
             )
             self.assertEqual(persisted["status"], "complete")
+            log_path = pathlib.Path(summary["outputs"]["log_file"])
+            log_records = [
+                json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(log_path.name, "视频处理日志.jsonl")
+            self.assertEqual(log_records[0]["event"], "pipeline_started")
+            self.assertEqual(log_records[-1]["event"], "pipeline_finished")
+            self.assertNotIn("test-only", log_path.read_text(encoding="utf-8"))
 
     def test_real_run_writes_processing_stats_xlsx_and_report_usage(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -1236,7 +1886,7 @@ class PipelineCliTests(unittest.TestCase):
                     )
 
             stdout = io.StringIO()
-            argv = [str(PIPELINE), str(video), str(output)]
+            argv = [str(PIPELINE), str(video), str(output), "--json-output"]
             with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-only"}, clear=True):
                 with mock.patch.object(sys, "argv", argv):
                     with mock.patch.object(run_video_course_pipeline, "run_stage", complete_stage):
@@ -1355,6 +2005,7 @@ class PipelineCliTests(unittest.TestCase):
                 "requested-visual-alias",
                 "--skip-asr",
                 "--skip-business",
+                "--json-output",
             ]
             with mock.patch.dict(os.environ, {"DASHSCOPE_API_KEY": "test-only"}, clear=True):
                 with mock.patch.object(sys, "argv", argv):
@@ -1502,6 +2153,10 @@ class SkillDocumentationTests(unittest.TestCase):
             "DashScope",
         ):
             self.assertIn(expected, combined)
+        self.assertIn("DashScope 原生", combined)
+        self.assertIn("multimodal-generation/generation", combined)
+        self.assertIn("text-generation/generation", combined)
+        self.assertNotIn("使用兼容 OpenAI 格式的文本接口", combined)
         self.assertIn("$video-course-to-markdown", metadata)
 
     def test_skill_documents_exact_configuration_and_local_cli_contract(self):
@@ -1548,8 +2203,8 @@ class SkillDocumentationTests(unittest.TestCase):
 
     def test_real_secret_is_not_committed(self):
         example = (ROOT / ".env.example").read_text(encoding="utf-8")
-        self.assertIn("DASHSCOPE_QWEN_API_KEY=sk-your-qwen-api-key", example)
-        self.assertIn("DASHSCOPE_ASR_API_KEY=sk-your-asr-api-key", example)
-        self.assertIn("# DASHSCOPE_API_KEY=sk-your-unified-api-key", example)
+        self.assertIn("DASHSCOPE_API_KEY=sk-your-unified-api-key", example)
+        self.assertIn("# DASHSCOPE_QWEN_API_KEY=sk-your-qwen-api-key", example)
+        self.assertIn("# DASHSCOPE_ASR_API_KEY=sk-your-asr-api-key", example)
         self.assertNotIn("sk-real", example)
         self.assertIn(".env", (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines())

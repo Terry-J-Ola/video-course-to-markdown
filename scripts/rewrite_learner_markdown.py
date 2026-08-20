@@ -3,15 +3,17 @@ import json
 import os
 import pathlib
 import re
-import urllib.error
+import time
 import urllib.request
 
 try:
     from .env_config import get_qwen_api_key
     from .http_transport import open_url
+    from .dashscope_errors import DashScopeAPIError, run_with_retries
 except ImportError:
     from env_config import get_qwen_api_key
     from http_transport import open_url
+    from dashscope_errors import DashScopeAPIError, run_with_retries
 
 
 INSTRUCTION = r"""
@@ -65,6 +67,10 @@ TECHNICAL_TERM_RE = re.compile(
     r"(?:\bVLM\b|\bASR\b|\bOCR\b|uncertain|confirmed|inferred|frame_\d+|\.json\b)",
     re.IGNORECASE,
 )
+DASHSCOPE_NATIVE_TEXT_URL = (
+    "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
+)
+API_PROTOCOL = "dashscope-native-text-v1"
 
 
 def normalize_text(text: str) -> str:
@@ -177,11 +183,14 @@ def preservation_prompt(blocks: list[str]) -> str:
 def call_model(api_key: str, model: str, prompt: str, temperature: float) -> tuple[str, dict]:
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": temperature,
+        "input": {"messages": [{"role": "user", "content": prompt}]},
+        "parameters": {
+            "temperature": temperature,
+            "result_format": "message",
+        },
     }
     request = urllib.request.Request(
-        "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        DASHSCOPE_NATIVE_TEXT_URL,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {api_key}",
@@ -189,21 +198,36 @@ def call_model(api_key: str, model: str, prompt: str, temperature: float) -> tup
         },
         method="POST",
     )
-    try:
+    def request_and_parse() -> tuple[str, dict]:
         with open_url(request, timeout=300) as response:
             result = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
+        if not isinstance(result, dict):
+            raise ValueError("text response must be an object")
+        output = result.get("output")
+        if not isinstance(output, dict):
+            raise ValueError("text response output must be an object")
+        choices = output.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise ValueError("text response has no choices")
+        message = choices[0].get("message")
+        if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+            raise ValueError("text response has no message content")
+        content = message["content"].strip()
+        if content.startswith("```markdown"):
+            content = content[len("```markdown") :].strip()
+        elif content.startswith("```"):
+            content = content[3:].strip()
+        if content.endswith("```"):
+            content = content[:-3].rstrip()
+        return content, result.get("usage", {})
 
-    content = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-    if content.startswith("```markdown"):
-        content = content[len("```markdown") :].strip()
-    elif content.startswith("```"):
-        content = content[3:].strip()
-    if content.endswith("```"):
-        content = content[:-3].rstrip()
-    return content, result.get("usage", {})
+    return run_with_retries(
+        request_and_parse,
+        service="text",
+        max_attempts=3,
+        sleep=time.sleep,
+        context={"model": model},
+    )
 
 
 def repair_missing_blocks(
@@ -316,6 +340,7 @@ def main() -> int:
         "fallback_appended": fallback_appended,
         **quality,
         "usage": {"initial": initial_usage, "repairs": repair_usage},
+        "api_protocol": API_PROTOCOL,
     }
     audit_path.parent.mkdir(parents=True, exist_ok=True)
     audit_path.write_text(json.dumps(audit, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

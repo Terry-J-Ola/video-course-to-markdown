@@ -8,7 +8,6 @@ import pathlib
 import re
 import sys
 import time
-import urllib.error
 import urllib.request
 
 try:
@@ -20,6 +19,7 @@ try:
     )
     from .env_config import get_qwen_api_key
     from .http_transport import open_url
+    from .dashscope_errors import DashScopeAPIError, run_with_retries
 except ImportError:
     from checkpoint_provenance import (
         checkpoint_matches,
@@ -29,6 +29,7 @@ except ImportError:
     )
     from env_config import get_qwen_api_key
     from http_transport import open_url
+    from dashscope_errors import DashScopeAPIError, run_with_retries
 
 
 SYSTEM_PROMPT = r"""
@@ -69,6 +70,12 @@ JSON 格式：
   ]
 }
 """.strip()
+
+DASHSCOPE_NATIVE_MULTIMODAL_URL = (
+    "https://dashscope.aliyuncs.com/api/v1/services/aigc/"
+    "multimodal-generation/generation"
+)
+API_PROTOCOL = "dashscope-native-multimodal-v1"
 
 
 def data_url(path: pathlib.Path) -> str:
@@ -128,16 +135,41 @@ def parse_json_content(content: str) -> dict:
 def response_content(raw: dict) -> str:
     if not isinstance(raw, dict):
         raise ValueError("visual response must be an object")
-    choices = raw.get("choices")
+    envelope = raw.get("output", raw)
+    if not isinstance(envelope, dict):
+        raise ValueError("visual response output must be an object")
+    choices = envelope.get("choices")
     if not isinstance(choices, list) or not choices:
         raise ValueError("visual response has no choices")
     first_choice = choices[0]
     if not isinstance(first_choice, dict):
         raise ValueError("visual response choice must be an object")
     message = first_choice.get("message")
-    if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+    if not isinstance(message, dict):
         raise ValueError("visual response has no message content")
-    return message["content"]
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = [
+            item["text"]
+            for item in content
+            if isinstance(item, dict) and isinstance(item.get("text"), str)
+        ]
+        if text_parts:
+            return "\n".join(text_parts)
+    raise ValueError("visual response has no message content")
+
+
+def response_model(raw: dict, requested_model: str) -> str:
+    if not isinstance(raw, dict):
+        return requested_model
+    output = raw.get("output")
+    candidates = [
+        raw.get("model"),
+        output.get("model") if isinstance(output, dict) else None,
+    ]
+    return next((value for value in candidates if isinstance(value, str) and value), requested_model)
 
 
 def invoke_group(
@@ -166,87 +198,69 @@ def invoke_group(
                 "source_frames": frames,
                 "result": parsed,
                 "usage": raw.get("usage", {}),
-                "model": raw.get("model", model),
+                "model": response_model(raw, model),
+                "api_protocol": API_PROTOCOL,
                 "resumed": True,
             }
 
-    content = [{"type": "text", "text": SYSTEM_PROMPT}]
+    content = [{"text": SYSTEM_PROMPT}]
     for frame_index, frame in enumerate(frames, start=1):
         timestamp = float(frame["timestamp_seconds"])
         content.append(
             {
-                "type": "text",
                 "text": f"FRAME {frame_index}; timestamp_seconds={timestamp:.3f}",
             }
         )
-        content.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": data_url(pathlib.Path(frame["image"]))},
-            }
-        )
+        content.append({"image": data_url(pathlib.Path(frame["image"]))})
 
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": content}],
-        "temperature": 0,
+        "input": {"messages": [{"role": "user", "content": content}]},
+        "parameters": {
+            "temperature": 0,
+            "result_format": "message",
+            "enable_thinking": False,
+            "response_format": {"type": "json_object"},
+        },
     }
     request = urllib.request.Request(
-        "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        DASHSCOPE_NATIVE_MULTIMODAL_URL,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         method="POST",
     )
 
-    last_error = None
-    for attempt in range(1, 4):
-        try:
-            with open_url(request, timeout=240) as response:
-                raw = json.loads(response.read().decode("utf-8"))
-            write_json_atomic(raw_path, raw)
-            message = response_content(raw)
-            parsed = parse_json_content(message)
-            if fingerprint is not None:
-                write_checkpoint(checkpoint_path, fingerprint)
-            return {
-                "group_id": group_id,
-                "source_frames": frames,
-                "result": parsed,
-                "usage": raw.get("usage", {}),
-                "model": raw.get("model", model),
-            }
-        except (
-            urllib.error.HTTPError,
-            urllib.error.URLError,
-            OSError,
-            TimeoutError,
-            json.JSONDecodeError,
-            TypeError,
-            ValueError,
-        ) as exc:
-            error_type = type(exc).__name__
-            if isinstance(exc, urllib.error.HTTPError):
-                body = exc.read().decode("utf-8", errors="replace")
-                last_error = f"HTTP {exc.code}: {body}"
-            else:
-                last_error = repr(exc)
-            print(
-                json.dumps(
-                    {
-                        "group_id": group_id,
-                        "attempt": attempt,
-                        "max_attempts": 3,
-                        "error_type": error_type,
-                        "error_message": last_error[:200],
-                    },
-                    ensure_ascii=False,
-                ),
-                file=sys.stderr,
-                flush=True,
-            )
-            if attempt < 3:
-                time.sleep(2**attempt)
-    raise RuntimeError(f"group {group_id} failed after 3 attempts: {last_error}")
+    def request_and_validate() -> tuple[dict, dict]:
+        with open_url(request, timeout=240) as response:
+            raw = json.loads(response.read().decode("utf-8"))
+        write_json_atomic(raw_path, raw)
+        message = response_content(raw)
+        parsed = parse_json_content(message)
+        return raw, parsed
+
+    try:
+        raw, parsed = run_with_retries(
+            request_and_validate,
+            service="visual",
+            max_attempts=3,
+            sleep=time.sleep,
+            context={"group_id": group_id},
+        )
+    except DashScopeAPIError as exc:
+        attempt_label = "attempt" if exc.attempt == 1 else "attempts"
+        raise RuntimeError(
+            f"group {group_id} failed after {exc.attempt} {attempt_label}: {exc}"
+        ) from exc
+    if fingerprint is not None:
+        write_checkpoint(checkpoint_path, fingerprint)
+    return {
+        "group_id": group_id,
+        "source_frames": frames,
+        "result": parsed,
+        "usage": raw.get("usage", {}),
+        "model": response_model(raw, model),
+        "api_protocol": API_PROTOCOL,
+    }
 
 
 def main() -> int:
@@ -277,6 +291,7 @@ def main() -> int:
     groups = [frames[index : index + args.group_size] for index in range(0, len(frames), args.group_size)]
     stage_fingerprint = {
         "stage": "visual-analysis",
+        "api_protocol": API_PROTOCOL,
         "input": file_identity(pathlib.Path(manifest["video"])),
         "model": args.model,
         "group_size": args.group_size,
@@ -318,6 +333,7 @@ def main() -> int:
     consolidated = {
         "video": manifest["video"],
         "model": producer_model,
+        "api_protocol": API_PROTOCOL,
         "producer_models": producer_models,
         "selected_frame_count": len(frames),
         "group_count": len(groups),

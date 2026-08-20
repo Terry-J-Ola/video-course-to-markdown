@@ -7,17 +7,18 @@ import shutil
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 
 try:
     from .checkpoint_provenance import checkpoint_matches, file_identity, write_checkpoint
+    from .dashscope_errors import DashScopeAPIError, run_with_retries
     from .env_config import get_asr_api_key
     from .http_transport import open_url
 except ImportError:
     from checkpoint_provenance import checkpoint_matches, file_identity, write_checkpoint
+    from dashscope_errors import DashScopeAPIError, run_with_retries
     from env_config import get_asr_api_key
     from http_transport import open_url
 
@@ -102,12 +103,17 @@ class SecureOssUtils:
             },
             method="POST",
         )
-        try:
+        def upload_audio() -> None:
             with open_url(request, timeout=3600):
                 pass
-        except urllib.error.HTTPError as exc:
-            error_body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"OSS upload failed with HTTP {exc.code}: {error_body}") from exc
+
+        run_with_retries(
+            upload_audio,
+            service="asr-upload",
+            max_attempts=3,
+            sleep=time.sleep,
+            context={"operation": "audio-upload"},
+        )
         return f"oss://{object_key}", upload_info
 
 
@@ -183,12 +189,18 @@ def request_json(url: str, api_key: str, method="GET", payload=None, oss_resolve
         headers["X-DashScope-OssResourceResolve"] = "enable"
     data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
+
+    def request_and_parse() -> dict:
         with open_url(request, timeout=180) as response:
             return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
+
+    return run_with_retries(
+        request_and_parse,
+        service="asr",
+        max_attempts=3,
+        sleep=time.sleep,
+        context={"method": method},
+    )
 
 
 def transcription_sentences(transcription: dict) -> list[dict]:
@@ -357,8 +369,20 @@ def main() -> int:
             transcription_url = results[0].get("transcription_url")
     if not transcription_url:
         raise RuntimeError(f"No transcription URL in task result: {task_result}")
-    with open_url(transcription_url, timeout=180) as response:
-        transcription = json.loads(response.read().decode("utf-8"))
+    def download_transcription() -> dict:
+        with open_url(transcription_url, timeout=180) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("transcription result must be an object")
+        return payload
+
+    transcription = run_with_retries(
+        download_transcription,
+        service="asr-result",
+        max_attempts=3,
+        sleep=time.sleep,
+        context={"operation": "transcription-download"},
+    )
     sentences = persist_transcription(
         transcription_path, checkpoint_path, transcription, fingerprint
     )
