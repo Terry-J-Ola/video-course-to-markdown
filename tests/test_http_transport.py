@@ -163,6 +163,32 @@ class HttpTransportTests(unittest.TestCase):
         ])
         self.assertEqual(payload["parameters"]["result_format"], "message")
 
+    def test_learner_model_call_tolerates_null_usage_and_records_producer_model(self):
+        response = http_transport.BufferedResponse(
+            json.dumps(
+                {
+                    "model": "qwen-plus-resolved",
+                    "output": {"choices": [{"message": {"content": "# Learner"}}]},
+                    "usage": None,
+                }
+            ).encode("utf-8"),
+            200,
+            "ok",
+            {},
+        )
+        with mock.patch.object(
+            rewrite_learner_markdown,
+            "open_url",
+            return_value=response,
+        ) as open_url:
+            content, usage = rewrite_learner_markdown.call_model(
+                "test-only", "qwen-plus", "prompt", 0.2
+            )
+
+        self.assertEqual(content, "# Learner")
+        self.assertEqual(usage, {"model": "qwen-plus-resolved"})
+        open_url.assert_called_once()
+
     def test_learner_authentication_error_is_classified_without_retry(self):
         error = urllib.error.HTTPError(
             "https://dashscope.aliyuncs.com/api",

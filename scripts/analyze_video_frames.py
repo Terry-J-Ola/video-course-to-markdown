@@ -342,7 +342,7 @@ def main() -> int:
     (output_dir / "consolidated.json").write_text(
         json.dumps(consolidated, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    print(json.dumps({"status": "complete", "output": str(output_dir / 'consolidated.json')}), flush=True)
+    print(json.dumps({"status": "complete", "model": producer_model, "output": str(output_dir / 'consolidated.json')}), flush=True)
     return 0
 
 

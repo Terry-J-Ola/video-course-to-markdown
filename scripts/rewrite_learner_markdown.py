@@ -180,6 +180,18 @@ def preservation_prompt(blocks: list[str]) -> str:
     )
 
 
+def response_model(result: dict, requested_model: str) -> str:
+    output = result.get("output")
+    candidates = [
+        result.get("model"),
+        output.get("model") if isinstance(output, dict) else None,
+    ]
+    return next(
+        (value for value in candidates if isinstance(value, str) and value),
+        requested_model,
+    )
+
+
 def call_model(api_key: str, model: str, prompt: str, temperature: float) -> tuple[str, dict]:
     payload = {
         "model": model,
@@ -219,7 +231,10 @@ def call_model(api_key: str, model: str, prompt: str, temperature: float) -> tup
             content = content[3:].strip()
         if content.endswith("```"):
             content = content[:-3].rstrip()
-        return content, result.get("usage", {})
+        raw_usage = result.get("usage")
+        usage = dict(raw_usage) if isinstance(raw_usage, dict) else {}
+        usage["model"] = response_model(result, model)
+        return content, usage
 
     return run_with_retries(
         request_and_parse,
@@ -286,6 +301,25 @@ def main() -> int:
         content = output.read_text(encoding="utf-8")
         missing = missing_blocks(mandatory, content)
         quality = output_quality(content, output)
+        existing_audit = {}
+        if audit_path.is_file():
+            try:
+                loaded_audit = json.loads(audit_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                loaded_audit = {}
+            if isinstance(loaded_audit, dict):
+                existing_audit = loaded_audit
+        existing_model = existing_audit.get("model")
+        if not isinstance(existing_model, str) or not existing_model:
+            existing_model = None
+        existing_producer_models = existing_audit.get("producer_models")
+        if not isinstance(existing_producer_models, list):
+            existing_producer_models = [existing_model] if existing_model else []
+        existing_producer_models = [
+            value
+            for value in existing_producer_models
+            if isinstance(value, str) and value
+        ]
         audit = {
             "source": str(pathlib.Path(args.source)),
             "output": str(output),
@@ -294,6 +328,8 @@ def main() -> int:
             "mandatory_blocks": len(mandatory),
             "preserved_blocks": len(mandatory) - len(missing),
             "missing_blocks": missing,
+            "model": existing_model,
+            "producer_models": existing_producer_models,
             "mode": "validate-existing",
             **quality,
         }
@@ -328,6 +364,22 @@ def main() -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(content + "\n", encoding="utf-8")
     quality = output_quality(content, output)
+    all_usage = [initial_usage, *repair_usage]
+    producer_models = list(
+        dict.fromkeys(
+            usage.get("model", args.model)
+            for usage in all_usage
+            if isinstance(usage, dict)
+            and isinstance(usage.get("model", args.model), str)
+            and usage.get("model", args.model)
+        )
+    )
+    final_usage = repair_usage[-1] if repair_usage else initial_usage
+    final_model = (
+        final_usage.get("model", args.model)
+        if isinstance(final_usage, dict)
+        else args.model
+    )
     audit = {
         "source": str(pathlib.Path(args.source)),
         "output": str(output),
@@ -336,6 +388,8 @@ def main() -> int:
         "mandatory_blocks": len(mandatory),
         "preserved_blocks": len(mandatory) - len(missing),
         "missing_blocks": missing,
+        "model": final_model,
+        "producer_models": producer_models,
         "repair_passes": len(repair_usage),
         "fallback_appended": fallback_appended,
         **quality,

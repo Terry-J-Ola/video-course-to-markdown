@@ -1401,11 +1401,23 @@ def main() -> int:
     if not args.dry_run:
         visual_data = json.loads((visual_dir / "consolidated.json").read_text(encoding="utf-8"))
         actual_visual_model = visual_data.get("model", args.visual_model)
+        transcription_data = read_optional_json(transcription)
+        asr_metadata = transcription_data.get("_video_course_metadata")
         asr_fingerprint = read_checkpoint_fingerprint(
             transcription.with_name("transcription.checkpoint.json")
         )
         if asr_fingerprint and asr_fingerprint.get("state") == "skipped":
             actual_asr_model = None
+        elif (
+            isinstance(asr_fingerprint, dict)
+            and asr_fingerprint.get("state") == "transcribed"
+            and asr_fingerprint.get("model") == args.asr_model
+            and isinstance(asr_metadata, dict)
+            and asr_metadata.get("requested_model") == args.asr_model
+            and isinstance(asr_metadata.get("producer_model"), str)
+            and asr_metadata["producer_model"]
+        ):
+            actual_asr_model = asr_metadata["producer_model"]
         elif asr_fingerprint:
             actual_asr_model = asr_fingerprint.get("model", args.asr_model)
         report["models"]["visual"] = actual_visual_model
@@ -1466,6 +1478,10 @@ def main() -> int:
         total_elapsed = round(time.monotonic() - run_started_monotonic, 2)
         audit_data = read_optional_json(audit)
         transcription_data = read_optional_json(transcription)
+        if not args.skip_business:
+            text_producer_model = audit_data.get("model")
+            if isinstance(text_producer_model, str) and text_producer_model:
+                report["models"]["text"] = text_producer_model
         usage = summarize_token_usage(visual_data, audit_data)
         asr_duration = transcription_duration_seconds(transcription_data)
         report["usage"] = {

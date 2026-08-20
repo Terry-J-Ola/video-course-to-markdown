@@ -12,12 +12,22 @@ import urllib.request
 import uuid
 
 try:
-    from .checkpoint_provenance import checkpoint_matches, file_identity, write_checkpoint
+    from .checkpoint_provenance import (
+        checkpoint_matches,
+        file_identity,
+        write_checkpoint,
+        write_json_atomic,
+    )
     from .dashscope_errors import DashScopeAPIError, run_with_retries
     from .env_config import get_asr_api_key
     from .http_transport import open_url
 except ImportError:
-    from checkpoint_provenance import checkpoint_matches, file_identity, write_checkpoint
+    from checkpoint_provenance import (
+        checkpoint_matches,
+        file_identity,
+        write_checkpoint,
+        write_json_atomic,
+    )
     from dashscope_errors import DashScopeAPIError, run_with_retries
     from env_config import get_asr_api_key
     from http_transport import open_url
@@ -222,6 +232,38 @@ def transcription_sentences(transcription: dict) -> list[dict]:
     return sentences
 
 
+def response_model(requested_model: str, *responses: dict) -> str:
+    for response in responses:
+        if not isinstance(response, dict):
+            continue
+        output = response.get("output")
+        candidates = [
+            response.get("model"),
+            output.get("model") if isinstance(output, dict) else None,
+        ]
+        resolved = next(
+            (value for value in candidates if isinstance(value, str) and value),
+            None,
+        )
+        if resolved:
+            return resolved
+    return requested_model
+
+
+def transcription_producer_model(transcription: dict, requested_model: str) -> str:
+    metadata = transcription.get("_video_course_metadata")
+    if not isinstance(metadata, dict):
+        return requested_model
+    if metadata.get("requested_model") != requested_model:
+        return requested_model
+    producer_model = metadata.get("producer_model")
+    return (
+        producer_model
+        if isinstance(producer_model, str) and producer_model
+        else requested_model
+    )
+
+
 def persist_transcription(
     transcription_path: pathlib.Path,
     checkpoint_path: pathlib.Path,
@@ -229,9 +271,7 @@ def persist_transcription(
     fingerprint: dict,
 ) -> list[dict]:
     sentences = transcription_sentences(transcription)
-    transcription_path.write_text(
-        json.dumps(transcription, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    write_json_atomic(transcription_path, transcription)
     write_checkpoint(checkpoint_path, fingerprint)
     return sentences
 
@@ -275,10 +315,12 @@ def main() -> int:
         except (OSError, json.JSONDecodeError, AttributeError, TypeError, ValueError):
             checkpoint_path.unlink(missing_ok=True)
         else:
+            producer_model = transcription_producer_model(transcription, args.model)
             print(
                 json.dumps(
                     {
                         "stage": "complete",
+                        "model": producer_model,
                         "resumed": True,
                         "sentences": len(sentences),
                         "duration_ms": max(
@@ -383,6 +425,16 @@ def main() -> int:
         sleep=time.sleep,
         context={"operation": "transcription-download"},
     )
+    asr_actual_model = response_model(
+        args.model,
+        task_result,
+        submit,
+        transcription,
+    )
+    transcription["_video_course_metadata"] = {
+        "requested_model": args.model,
+        "producer_model": asr_actual_model,
+    }
     sentences = persist_transcription(
         transcription_path, checkpoint_path, transcription, fingerprint
     )
@@ -390,6 +442,7 @@ def main() -> int:
         json.dumps(
             {
                 "stage": "complete",
+                "model": asr_actual_model,
                 "sentences": len(sentences),
                 "duration_ms": max((item.get("end_time", 0) for item in sentences), default=0),
             }

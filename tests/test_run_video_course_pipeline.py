@@ -826,6 +826,7 @@ class ResumeProvenanceTests(unittest.TestCase):
                 if method == "POST":
                     return {"output": {"task_id": "task-1"}}
                 return {
+                    "model": "paraformer-v2-resolved",
                     "output": {
                         "task_status": "SUCCEEDED",
                         "result": {"transcription_url": "https://example.invalid/result"},
@@ -868,6 +869,13 @@ class ResumeProvenanceTests(unittest.TestCase):
             configure.assert_called_once()
             saved = json.loads((asr_dir / "transcription.json").read_text(encoding="utf-8"))
             self.assertEqual(saved["transcripts"][0]["sentences"][0]["text"], "fresh")
+            self.assertEqual(
+                saved["_video_course_metadata"],
+                {
+                    "requested_model": "paraformer-v2",
+                    "producer_model": "paraformer-v2-resolved",
+                },
+            )
 
     def test_asr_checkpoint_reuse_requires_matching_input_and_model(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -1851,6 +1859,10 @@ class PipelineCliTests(unittest.TestCase):
                     (asr_dir / "transcription.json").write_text(
                         json.dumps(
                             {
+                                "_video_course_metadata": {
+                                    "requested_model": "paraformer-v2",
+                                    "producer_model": "paraformer-v2-resolved",
+                                },
                                 "transcripts": [
                                     {
                                         "content_duration_in_milliseconds": 12_500,
@@ -1861,11 +1873,21 @@ class PipelineCliTests(unittest.TestCase):
                         ),
                         encoding="utf-8",
                     )
+                    transcribe_video_audio.write_checkpoint(
+                        asr_dir / "transcription.checkpoint.json",
+                        {
+                            "stage": "asr",
+                            "input": transcribe_video_audio.file_identity(video),
+                            "state": "transcribed",
+                            "model": "paraformer-v2",
+                        },
+                    )
                 elif name == "learner-markdown-and-audit":
                     audit_path = pathlib.Path(option_value(command, "--audit-output"))
                     audit_path.write_text(
                         json.dumps(
                             {
+                                "model": "qwen-plus-resolved",
                                 "usage": {
                                     "initial": {
                                         "prompt_tokens": 20,
@@ -1907,6 +1929,8 @@ class PipelineCliTests(unittest.TestCase):
             self.assertEqual(rows[0]["单视频总Token"], 45)
             self.assertEqual(rows[0]["ASR音频时长（秒）"], 12.5)
             self.assertEqual(rows[0]["视觉分析耗时（秒）"], 2.0)
+            self.assertEqual(rows[0]["ASR模型"], "paraformer-v2-resolved")
+            self.assertEqual(rows[0]["文本模型"], "qwen-plus-resolved")
             batch_sheet = workbook["批次汇总"]
             batch_values = dict(
                 zip(
@@ -1920,6 +1944,17 @@ class PipelineCliTests(unittest.TestCase):
             report = json.loads(pathlib.Path(summary["report"]).read_text(encoding="utf-8"))
             self.assertEqual(report["usage"]["qwen_total_tokens"], 45)
             self.assertEqual(report["usage"]["asr_audio_seconds"], 12.5)
+            self.assertEqual(report["models"]["asr"], "paraformer-v2-resolved")
+            self.assertEqual(report["models"]["text"], "qwen-plus-resolved")
+            evidence_command = next(
+                item["command"]
+                for item in report["stages"]
+                if item["name"] == "evidence-markdown"
+            )
+            self.assertEqual(
+                option_value(evidence_command, "--asr-model"),
+                "paraformer-v2-resolved",
+            )
             self.assertIn("started_at", report["timing"])
             self.assertIn("finished_at", report["timing"])
 
@@ -2082,6 +2117,39 @@ class StageDefaultTests(unittest.TestCase):
                         with contextlib.redirect_stdout(io.StringIO()):
                             self.assertEqual(rewrite_learner_markdown.main(), 0)
             self.assertEqual(call_model.call_args.args[1], "qwen-plus")
+
+    def test_validate_existing_preserves_known_model_and_does_not_invent_one(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            source = root / "evidence.md"
+            source.write_text("# Course\n", encoding="utf-8")
+            output = root / "learner.md"
+            output.write_text("# Existing\n", encoding="utf-8")
+
+            def validate(audit: pathlib.Path) -> dict:
+                argv = [
+                    "rewrite_learner_markdown.py",
+                    str(source),
+                    str(output),
+                    "--model",
+                    "requested-but-not-called",
+                    "--audit-output",
+                    str(audit),
+                    "--validate-existing",
+                ]
+                with mock.patch.object(sys, "argv", argv):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(rewrite_learner_markdown.main(), 0)
+                return json.loads(audit.read_text(encoding="utf-8"))
+
+            known_audit = root / "known-audit.json"
+            known_audit.write_text(
+                json.dumps({"model": "original-producer"}), encoding="utf-8"
+            )
+            self.assertEqual(validate(known_audit)["model"], "original-producer")
+
+            unknown_audit = root / "unknown-audit.json"
+            self.assertIsNone(validate(unknown_audit)["model"])
 
     def test_evidence_assembly_defaults_and_visual_json_fallback_are_observable(self):
         with tempfile.TemporaryDirectory() as raw:
